@@ -67,6 +67,7 @@ import (
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rc4"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -658,7 +659,7 @@ func (v Value) Name() string {
 // Like the result of the Name method, the key should not include a leading slash.
 // If v is a stream, Key applies to the stream's header dictionary.
 // If v.Kind() != Dict and v.Kind() != Stream, Key returns a null Value.
-func (v Value) Key(key string) Value {
+func (v Value) Key(key string) (Value, error) {
 	x, ok := v.data.(dict)
 	if !ok {
 		strm, ok := v.data.(stream)
@@ -667,7 +668,12 @@ func (v Value) Key(key string) Value {
 		}
 		x = strm.hdr
 	}
-	return v.r.resolve(v.ptr, x[name(key)])
+	val, err := v.r.resolve(v.ptr, x[name(key)])
+	if err != nil {
+		return Value{}, err
+	}
+
+	return val, nil
 }
 
 // Keys returns a sorted list of the keys in the dictionary v.
@@ -693,12 +699,17 @@ func (v Value) Keys() []string {
 // Index returns the i'th element in the array v.
 // If v.Kind() != Array or if i is outside the array bounds,
 // Index returns a null Value.
-func (v Value) Index(i int) Value {
+func (v Value) Index(i int) (Value, error) {
 	x, ok := v.data.(array)
 	if !ok || i < 0 || i >= len(x) {
 		return Value{}
 	}
-	return v.r.resolve(v.ptr, x[i])
+	val, err := v.r.resolve(v.ptr, x[i])
+	if err != nil {
+		return Value{}, err
+	}
+
+	return val, nil
 }
 
 // Len returns the length of the array v.
@@ -716,7 +727,7 @@ func (r *Reader) Close() error {
 	return r.f.Close()
 }
 
-func (r *Reader) resolve(parent objptr, x interface{}) Value {
+func (r *Reader) resolve(parent objptr, x interface{}) (Value, error) {
 	if ptr, ok := x.(objptr); ok {
 		if ptr.id >= uint32(len(r.xref)) {
 			return Value{}
@@ -727,19 +738,23 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 		}
 		var obj object
 		if xref.inStream {
-			strm := r.resolve(parent, xref.stream)
+			strm, err := r.resolve(parent, xref.stream)
+			if err != nil {
+				return Value{}, err
+			}
+
 		Search:
 			for {
 				if strm.Kind() != Stream {
-					panic("not a stream")
+					return Value{}, errors.New("not a stream")
 				}
 				if strm.Key("Type").Name() != "ObjStm" {
-					panic("not an object stream")
+					return Value{}, errors.New("not an object stream")
 				}
 				n := int(strm.Key("N").Int64())
 				first := strm.Key("First").Int64()
 				if first == 0 {
-					panic("missing First")
+					return Value{}, errors.New("missing First")
 				}
 				b := newBuffer(strm.Reader(), 0)
 				b.allowEOF = true
@@ -754,7 +769,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				}
 				ext := strm.Key("Extends")
 				if ext.Kind() != Stream {
-					panic("cannot find object in stream")
+					return Value{}, errors.New("cannot find object in stream")
 				}
 				strm = ext
 			}
@@ -765,11 +780,10 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 			obj = b.readObject()
 			def, ok := obj.(objdef)
 			if !ok {
-				panic(fmt.Errorf("loading %v: found %T instead of objdef", ptr, obj))
-				return Value{}
+				return Value{}, fmt.Errorf("loading %v: found %T instead of objdef", ptr, obj)
 			}
 			if def.ptr != ptr {
-				panic(fmt.Errorf("loading %v: found %v", ptr, def.ptr))
+				return Value{}, fmt.Errorf("loading %v: found %v", ptr, def.ptr)
 			}
 			x = def.obj
 		}
@@ -782,7 +796,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 	case string:
 		return Value{r, parent, x}
 	default:
-		panic(fmt.Errorf("unexpected value type %T in resolve", x))
+		return Value{}, fmt.Errorf("unexpected value type %T in resolve", x)
 	}
 }
 
@@ -892,7 +906,11 @@ var passwordPad = []byte{
 
 func (r *Reader) initEncrypt(password string) error {
 	// See PDF 32000-1:2008, §7.6.
-	encrypt, _ := r.resolve(objptr{}, r.trailer["Encrypt"]).data.(dict)
+	val, err := r.resolve(objptr{}, r.trailer["Encrypt"])
+	if err != nil {
+		return err
+	}
+	encrypt, _ := val.data.(dict)
 	if encrypt["Filter"] != name("Standard") {
 		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
 	}
